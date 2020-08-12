@@ -19,6 +19,7 @@ import time
 import hashlib
 
 import etesync as api
+import etebase as Etebase
 from .radicale.creds import Credentials
 from .radicale.etesync_cache import etesync_for_user
 from etesync_dav.config import CREDS_FILE, HTPASSWD_FILE, ETESYNC_URL, DATA_DIR, LEGACY_CONFIG_DIR
@@ -128,6 +129,51 @@ class Manager:
                     inst.save()
 
                     etesync.sync_journal_list()
+        except Exception as e:
+            # Remove the username on error
+            self.htpasswd.delete(username)
+            self.creds.delete(username)
+            self.htpasswd.save()
+            self.creds.save()
+            raise e
+
+        return self.get(username)
+
+    def add_etebase(self, username, password):
+        exists = self.validate_username(username)
+        if exists:
+            raise RuntimeError("User already exists. Delete first if you'd like to override settings.")
+
+        print("Logging in")
+        client = Etebase.Client.new("etesync-dav", self.remote_url)
+        etebase = Etebase.Account.login(client, username, password)
+
+        print("Saving config")
+        generated_password = self._generate_pasword()
+        self.htpasswd.set(username, generated_password)
+        self.creds.set_etebase(username, etebase.save(None))
+        self.htpasswd.save()
+        self.creds.save()
+
+        print("Initializing account")
+        try:
+            existing = {}
+            col_mgr = etebase.get_collection_manager()
+            collections = col_mgr.list(None)
+            for col in collections.get_data():
+                meta = col.get_meta()
+                existing[meta.get_collection_type()] = True
+
+            wanted = [
+                ["etebase.vcard", "My Contacts"],
+                ["etebase.vevent", "My Calendar"],
+                ["etebase.vtodo", "My Tasks"],
+            ]
+            for [col_type, name] in wanted:
+                if col_type not in existing:
+                    meta = Etebase.CollectionMetadata(col_type, name)
+                    col = col_mgr.create(meta, b"")
+                    col_mgr.upload(col)
         except Exception as e:
             # Remove the username on error
             self.htpasswd.delete(username)

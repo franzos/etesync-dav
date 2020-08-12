@@ -1,95 +1,19 @@
-# Copyright © 2017 Tom Hacohen
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, version 3.
-#
-# This library is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
-
-import logging
 import re
-from contextlib import contextmanager
-import threading
-import hashlib
-import posixpath
-import time
 
-from .etesync_cache import etesync_for_user
-from .href_mapper import HrefMapper
-
-import etesync as api
 from radicale import pathutils
-from radicale.item import Item, get_etag
+from radicale.item import Item
 from radicale.storage import (
-        BaseCollection, BaseStorage, ComponentNotFoundError,
+        BaseCollection, ComponentNotFoundError,
     )
 import vobject
 
-from ..local_cache import Etebase
-from .storage_etebase_collection import Collection as EtebaseCollection
-
-
-logger = logging.getLogger('etesync-dav')
-
-
-# How often we should sync automatically, in seconds
-SYNC_INTERVAL = 15 * 60
-# Minimum time to wait between syncs
-SYNC_MINIMUM = 30
-
-
-class SyncThread(threading.Thread):
-    def __init__(self, user, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._force_sync = threading.Event()
-        self._done_syncing = threading.Event()
-        self._done_syncing.set()  # We are done before we start.
-        self.user = user
-        self.last_sync = None
-
-    def force_sync(self):
-        self._force_sync.set()
-        self._done_syncing.clear()
-
-    def request_sync(self):
-        if self.last_sync and time.time() - self.last_sync >= SYNC_MINIMUM:
-            self.force_sync()
-
-    @property
-    def forced_sync(self):
-        return self._force_sync.is_set()
-
-    def wait_for_sync(self, timeout=None):
-        return self._done_syncing.wait(timeout)
-
-    def run(self):
-        while True:
-            try:
-                with etesync_for_user(self.user) as (etesync, _):
-                    self.last_sync = time.time()
-                    self._done_syncing.clear()
-
-                    etesync.sync()
-            except Exception as e:
-                # Print errors but keep on syncing in the background
-                logger.exception(e)
-            finally:
-                self._force_sync.clear()
-                self._done_syncing.set()
-
-            self._force_sync.wait(SYNC_INTERVAL)
+from ..local_cache.models import HrefMapper
 
 
 class MetaMapping:
     # Mappings between etesync meta and radicale
     _mappings = {
-            "D:displayname": ("displayName", None, None),
+            "D:displayname": ("name", None, None),
         }
 
     @classmethod
@@ -118,41 +42,12 @@ class MetaMapping:
         return key, value
 
 
-def RgbToInt(str_color):
-    if str_color is None:
-        return None
-
-    str_color = str_color[1:]
-    color = int(str_color, 16)
-
-    if len(str_color) == 8:  # RGBA
-        alpha = color & 0xFF
-        color = color >> 8
-    else:
-        alpha = 0xFF
-
-    color |= alpha << 24
-    return color
-
-
-def IntToRgb(color):
-    if color is None:
-        return None
-
-    blue = color & 0xFF
-    green = (color >> 8) & 0xFF
-    red = (color >> 16) & 0xFF
-    alpha = (color >> 24) & 0xFF
-
-    return '#%02x%02x%02x%02x' % (red, green, blue, alpha or 0xFF)
-
-
 class MetaMappingCalendar(MetaMapping):
     supported_calendar_component = 'VEVENT'
     _mappings = MetaMapping._mappings.copy()
     _mappings.update({
             "C:calendar-description": ("description", None, None),
-            "ICAL:calendar-color": ("color", IntToRgb, RgbToInt),
+            "ICAL:calendar-color": ("color", None, None),
         })
     MetaMapping._reverse_mapping(_mappings)
 
@@ -176,16 +71,6 @@ def _trim_suffix(path, suffixes):
             break
 
     return path
-
-
-def _is_principal(path):
-    sane_path = pathutils.sanitize_path(path).strip("/")
-    attributes = sane_path.split("/")
-    if not attributes[0]:
-        attributes.pop()
-
-    # It's a principal if all we have is the user
-    return len(attributes) == 1
 
 
 def _get_attributes_from_path(path):
@@ -238,7 +123,7 @@ class EteSyncItem(Item):
     @property
     def etag(self):
         """Encoded as quoted-string (see RFC 2616)."""
-        return get_etag(self.vobject_item.serialize())
+        return '"{}"'.format(self.etesync_item.etag)
 
 
 class Collection(BaseCollection):
@@ -251,17 +136,17 @@ class Collection(BaseCollection):
         self.etesync = self._storage.etesync
         if len(attributes) == 2:
             self.uid = attributes[-1]
-            self.journal = self.etesync.get(self.uid)
-            self.collection = self.journal.collection
-            if isinstance(self.collection, api.Calendar):
+            self.collection = self.etesync.get(self.uid)
+            col_type = self.collection.col_type
+            if col_type == "etebase.vevent":
                 self.tag = "VCALENDAR"
                 self.meta_mappings = MetaMappingCalendar()
                 self.content_suffix = ".ics"
-            elif isinstance(self.collection, api.TaskList):
+            elif col_type == "etebase.vtodo":
                 self.tag = "VCALENDAR"
                 self.meta_mappings = MetaMappingTaskList()
                 self.content_suffix = ".ics"
-            elif isinstance(self.collection, api.AddressBook):
+            elif col_type == "etebase.vcard":
                 self.tag = "VADDRESSBOOK"
                 self.meta_mappings = MetaMappingContacts()
                 self.content_suffix = ".vcf"
@@ -282,11 +167,7 @@ class Collection(BaseCollection):
         if self.is_fake:
             return
 
-        entry = None
-        for entry in self.journal.list():
-            pass
-
-        return entry.uid if entry is not None else self.journal.uid
+        return '"{}"'.format(self.collection.stoken)
 
     def sync(self, old_token=None):
         """Get the current sync token and changed items for synchronization.
@@ -310,11 +191,11 @@ class Collection(BaseCollection):
 
         for item in self.collection.list():
             try:
-                href_mapper = item._cache_obj.href.get()
+                href_mapper = item.cache_item.href.get()
             except HrefMapper.DoesNotExist:
                 # Generate a new mapper
-                href = hashlib.sha256(item.uid.encode()).hexdigest() + self.content_suffix
-                href_mapper = HrefMapper(content=item._cache_obj, href=href)
+                href = item.item.get_uid() + self.content_suffix
+                href_mapper = HrefMapper(content=item.cache_item, href=href)
                 href_mapper.save(force_insert=True)
 
             href = href_mapper.href
@@ -389,17 +270,15 @@ class Collection(BaseCollection):
         if self.is_fake:
             return
 
-        content = vobject_item.serialize()
-
         item = self._get(href)
         if item is not None:
             etesync_item = item.etesync_item
-            etesync_item.content = content
+            etesync_item.content = vobject_item.serialize()
             etesync_item.save()
         else:
-            etesync_item = self.collection.get_content_class().create(self.collection, content)
+            etesync_item = self.collection.create(vobject_item)
             etesync_item.save()
-            href_mapper = HrefMapper(content=etesync_item._cache_obj, href=href)
+            href_mapper = HrefMapper(content=etesync_item.cache_item, href=href)
             href_mapper.save(force_insert=True)
 
         return self._get(href)
@@ -437,11 +316,13 @@ class Collection(BaseCollection):
             return self.tag
         elif key is None:
             ret = {}
-            for key in self.journal.info.keys():
-                ret[key] = self.meta_mappings.map_get(self.journal.info, key)[1]
+            meta = self.collection.meta
+            for key in meta.keys():
+                ret[key] = self.meta_mappings.map_get(meta, key)[1]
             return ret
         else:
-            key, value = self.meta_mappings.map_get(self.journal.info, key)
+            meta = self.collection.meta
+            key, value = self.meta_mappings.map_get(meta, key)
             return value
 
     def set_meta(self, _props):
@@ -461,162 +342,10 @@ class Collection(BaseCollection):
         # Pop out tag which we don't want
         props.pop("tag", None)
 
-        self.journal.update_info({})
-        self.journal.update_info(props)
-        self.journal.save()
+        self.collection.update_meta(props)
+        self.collection.save()
 
     @property
     def last_modified(self):
         """Get the HTTP-datetime of when the collection was modified."""
         return ''
-
-
-class Storage(BaseStorage):
-    """Collection stored in several files per calendar."""
-
-    _sync_thread_lock = threading.RLock()
-
-    def __init__(self, configuration):
-        self.user = None
-        self.etesync = None
-        super().__init__(configuration)
-
-    def discover(self, path, depth="0"):
-        """Discover a list of collections under the given ``path``.
-
-        If ``depth`` is "0", only the actual object under ``path`` is
-        returned.
-
-        If ``depth`` is anything but "0", it is considered as "1" and direct
-        children are included in the result.
-
-        The ``path`` is relative.
-
-        The root collection "/" must always exist.
-
-        """
-
-        if isinstance(self.etesync, Etebase):
-            cls = EtebaseCollection
-        else:
-            cls = Collection
-
-        # Path should already be sanitized
-        attributes = _get_attributes_from_path(path)
-        if len(attributes) == 3:
-            if path.endswith('/'):
-                # XXX Workaround UIDs with slashes in them - just continue as if path was one step above
-                path = posixpath.join("/", attributes[0], attributes[1], "")
-                attributes = _get_attributes_from_path(path)
-            else:
-                # XXX We would rather not rewrite urls, but we do it if urls contain /
-                attributes[-1] = attributes[-1].replace('/', ',')
-                path = posixpath.join("/", *attributes)
-
-        try:
-            if len(attributes) == 3:
-                # If an item, create a collection for the item.
-                item = attributes.pop()
-                path = "/".join(attributes)
-                collection = cls(self, path)
-                yield collection._get(item)
-                return
-
-            collection = cls(self, path)
-        except api.exceptions.DoesNotExist:
-            return
-
-        yield collection
-
-        if depth == "0":
-            return
-
-        if len(attributes) == 0:
-            yield cls(self, posixpath.join(path, cls.user))
-        elif len(attributes) == 1:
-            if isinstance(self.etesync, Etebase):
-                for journal in self.etesync.list():
-                    if journal.col_type in ["etebase.vcard", "etebase.vevent", "etebase.vtodo"]:
-                        yield cls(self, posixpath.join(path, journal.uid))
-            else:
-                for journal in self.etesync.list():
-                    if journal.collection.TYPE in (api.AddressBook.TYPE, api.Calendar.TYPE, api.TaskList.TYPE):
-                        yield cls(self, posixpath.join(path, journal.uid))
-        elif len(attributes) == 2:
-            for href in collection._list():
-                yield collection._get(href)
-
-        elif len(attributes) > 2:
-            raise RuntimeError("Found more than one attribute. Shouldn't happen")
-
-    def move(self, item, to_collection, to_href):
-        """Move an object.
-
-        ``item`` is the item to move.
-
-        ``to_collection`` is the target collection.
-
-        ``to_href`` is the target name in ``to_collection``. An item with the
-        same name might already exist.
-
-        """
-        raise NotImplementedError
-
-    def create_collection(self, href, items=None, props=None):
-        """Create a collection.
-
-        ``href`` is the sanitized path.
-
-        If the collection already exists and neither ``collection`` nor
-        ``props`` are set, this method shouldn't do anything. Otherwise the
-        existing collection must be replaced.
-
-        ``collection`` is a list of vobject components.
-
-        ``props`` are metadata values for the collection.
-
-        ``props["tag"]`` is the type of collection (VCALENDAR or
-        VADDRESSBOOK). If the key ``tag`` is missing, it is guessed from the
-        collection.
-
-        """
-
-        # We don't want to allow this
-        raise NotImplementedError
-
-    @contextmanager
-    def acquire_lock(self, mode, user=None):
-        """Set a context manager to lock the whole storage.
-
-        ``mode`` must either be "r" for shared access or "w" for exclusive
-        access.
-
-        ``user`` is the name of the logged in user or empty.
-
-        """
-        if not user:
-            return
-
-        with etesync_for_user(user) as (etesync, _):
-            with self.__class__._sync_thread_lock:
-                if not hasattr(etesync, 'sync_thread'):
-                    etesync.sync_thread = SyncThread(user, daemon=True)
-                    etesync.sync_thread.start()
-                else:
-                    etesync.sync_thread.request_sync()
-
-        # At most wait for 5 seconds before returning stale data
-        etesync.sync_thread.wait_for_sync(5)
-
-        with etesync_for_user(user) as (etesync, _):
-            self.user = user
-            self.etesync = etesync
-
-            yield
-
-            # Always push changes if we made changes
-            if mode == "w":
-                etesync.sync_thread.force_sync()
-
-            self.etesync = None
-            self.user = None
