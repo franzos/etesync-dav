@@ -146,7 +146,7 @@ def login():
             creds = Credentials(config.CREDS_FILE)
             stored_session = creds.get_etebase(form.username.data)
             if stored_session is not None:
-                client = Client.new("etesync-dav", ETESYNC_URL)
+                client = Client("etesync-dav", ETESYNC_URL)
                 etebase = Account.login(client, form.username.data, form.login_password.data)
                 etebase.logout()
             else:
